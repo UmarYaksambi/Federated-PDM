@@ -1,0 +1,55 @@
+# ============================================================
+# Federated Predictive Maintenance — Master Configuration
+# All hyperparameters live here. Scripts read this file.
+# ============================================================
+
+data:
+  data_dir: "./data"
+  output_dir: "./client_data"
+  clients: ["FD001", "FD002", "FD003", "FD004"]
+  selected_sensors: [2, 3, 4, 7, 8, 9, 11, 12, 13, 14, 15, 17, 20, 21]
+  hi_sensors: ["s_2", "s_3", "s_4", "s_11", "s_15"]
+  max_rul: 125
+  window_size: 30
+  stride: 1
+
+simulation:
+  n_trajectories: 300       # synthetic trajectories per client
+  late_rul_threshold: 50    # only keep windows with RUL <= this
+  noise_std: 0.02           # additive Gaussian noise on synthetic signals
+  max_lifetime: 400         # cap simulated engine lifetime (cycles)
+  seed: 42
+
+model:
+  input_size: 14            # number of sensor features
+  hidden_channels: 64
+  num_levels: 4             # TCN dilation levels: 1, 2, 4, 8
+  kernel_size: 3
+  dropout: 0.2              # applied during training AND MC-Dropout inference
+  mc_samples: 50            # forward passes for uncertainty estimation
+
+loss:
+  lambda_physics: 0.1       # weight of monotonicity constraint in hybrid loss
+  # Total loss = MSE(RUL) + lambda_physics * MonotonicityViolation(HI)
+
+training:
+  epochs_local: 5           # local training epochs per FL round
+  batch_size: 64
+  learning_rate: 0.001
+  weight_decay: 1e-4
+  lr_scheduler: "cosine"    # cosine annealing
+
+federation:
+  num_rounds: 50            # FL communication rounds
+  min_clients: 4
+  strategy: "similarity_weighted"  # options: fedavg | fedprox | similarity_weighted
+
+  # FedProx specific
+  fedprox_mu: 0.01          # proximal term weight
+
+evaluation:
+  seeds: [42, 123, 456, 789, 1024]   # 5 seeds for statistical significance
+  results_dir: "./results"
+
+reproducibility:
+  seed: 42
