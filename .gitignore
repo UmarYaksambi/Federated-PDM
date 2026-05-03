@@ -35,7 +35,6 @@ datasets/
 *.pth
 *.ckpt
 checkpoints/
-models/
 
 # =========================
 # datas & outputs
