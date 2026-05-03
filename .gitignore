@@ -18,10 +18,12 @@ ENV/
 *.nbconvert.ipynb
 
 # =========================
-# Data (IMPORTANT)
+# Data & Project Outputs (Updated)
 # =========================
 data/
 datasets/
+client_data/         # Created by preprocess.py (contains large .npz and figures)
+results/             # Evaluation metrics and logs
 *.csv
 *.txt
 *.zip
@@ -31,27 +33,20 @@ datasets/
 # =========================
 # Model weights & checkpoints
 # =========================
-*.pt
+*.pt                 # Centralised and Federated checkpoints
 *.pth
 *.ckpt
 checkpoints/
 
 # =========================
-# datas & outputs
+# Logs & Temp
 # =========================
 logs/
 runs/
-results/
 *.data
 !data/sample/
 *.out
-
-# TensorBoard
 events.out.tfevents.*
-
-# =========================
-# Kaggle / temp
-# =========================
 /kaggle/
 *.tmp
 
@@ -70,7 +65,7 @@ events.out.tfevents.*
 Thumbs.db
 
 # =========================
-# Misc
+# Misc Binary Files
 # =========================
 *.pkl
 *.pickle
@@ -80,7 +75,7 @@ Thumbs.db
 *.npz
 
 # =========================
-# Secrets (VERY IMPORTANT)
+# Secrets
 # =========================
 .env
 *.env
