@@ -31,19 +31,19 @@ from sklearn.isotonic import IsotonicRegression
 from sklearn.preprocessing import MinMaxScaler
 
 
-# ── Reproducibility ──────────────────────────────────────────────────────────
+# Reproducibility
 def set_seeds(seed: int):
     random.seed(seed)
     np.random.seed(seed)
 
 
-# ── Config ───────────────────────────────────────────────────────────────────
+# Config
 def load_config(path: str = "config.yaml") -> dict:
     with open(path) as f:
         return yaml.safe_load(f)
 
 
-# ── Loading ──────────────────────────────────────────────────────────────────
+# Loading
 def load_cmapss(path: str) -> pd.DataFrame:
     cols = (
         ["unit_id", "cycle"]
@@ -54,7 +54,7 @@ def load_cmapss(path: str) -> pd.DataFrame:
     return df
 
 
-# ── RUL labelling ────────────────────────────────────────────────────────────
+# RUL labelling
 def label_train_rul(df: pd.DataFrame, max_rul: int) -> pd.DataFrame:
     max_cycle = (
         df.groupby("unit_id")["cycle"].max().reset_index(name="max_cycle")
@@ -79,7 +79,7 @@ def label_test_rul(
     return test_df.drop(columns=["max_cycle"])
 
 
-# ── Health Index ─────────────────────────────────────────────────────────────
+# Health Index
 def compute_health_index(
     df: pd.DataFrame, hi_sensors: list[str]
 ) -> pd.DataFrame:
@@ -105,7 +105,7 @@ def compute_health_index(
     return df
 
 
-# ── Sliding window ───────────────────────────────────────────────────────────
+# Sliding window
 def create_sequences(
     df: pd.DataFrame,
     sensor_cols: list[str],
@@ -126,7 +126,7 @@ def create_sequences(
     )
 
 
-# ── KL divergence ────────────────────────────────────────────────────────────
+# KL divergence
 def kl_divergence(p: np.ndarray, q: np.ndarray, bins: int = 50) -> float:
     eps = 1e-10
     edges = np.linspace(
@@ -139,14 +139,14 @@ def kl_divergence(p: np.ndarray, q: np.ndarray, bins: int = 50) -> float:
     return float(entropy(ph, qh))
 
 
-# ── Weibull fitting ──────────────────────────────────────────────────────────
+# Weibull fitting
 def fit_weibull(train_df: pd.DataFrame) -> tuple[float, float, np.ndarray]:
     lifetimes = train_df.groupby("unit_id")["cycle"].max().values.astype(float)
     shape, _, scale = weibull_min.fit(lifetimes, floc=0)
     return float(shape), float(scale), lifetimes
 
 
-# ── Figures ──────────────────────────────────────────────────────────────────
+# Figures
 def plot_noniid(clients: dict, fig_dir: str):
     fd_keys = list(clients.keys())
     colors = ["#2E86C1", "#1E8449", "#E67E22", "#8E44AD"]
@@ -190,7 +190,7 @@ def plot_hi(clients: dict, fig_dir: str):
     print(f"  Saved {path}")
 
 
-# ── Main ─────────────────────────────────────────────────────────────────────
+# Main
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--config", default="config.yaml")
@@ -216,7 +216,7 @@ def main():
 
     clients = {}
 
-    # ── Load + preprocess each client ────────────────────────────────────────
+    # Load + preprocess each client
     print("\n[1/5] Loading and preprocessing all 4 clients...")
     for fd in fd_keys:
         train_df = load_cmapss(os.path.join(data_dir, f"train_{fd}.txt"))
@@ -251,7 +251,7 @@ def main():
         }
         print(f"  {fd}: X_train={X_train.shape}  X_test={X_test.shape}")
 
-    # ── Non-IID quantification ────────────────────────────────────────────────
+    # Non-IID quantification
     print("\n[2/5] Computing KL-divergence matrix (Table 1 in paper)...")
     kl_matrix = pd.DataFrame(index=fd_keys, columns=fd_keys, dtype=float)
     for i in fd_keys:
@@ -263,7 +263,7 @@ def main():
     print(kl_matrix.to_string())
     kl_matrix.to_csv(os.path.join(output_dir, "kl_divergence_matrix.csv"))
 
-    # ── Weibull fitting ───────────────────────────────────────────────────────
+    # Weibull fitting
     print("\n[3/5] Fitting Weibull parameters per client...")
     weibull_params = {}
     print(f"  {'Client':<8} {'k':>8} {'λ':>10} {'KS-stat':>10} {'p-value':>10} {'Fit'}")
@@ -280,7 +280,7 @@ def main():
     with open(os.path.join(output_dir, "weibull_params.json"), "w") as f:
         json.dump(weibull_params, f, indent=2)
 
-    # ── Save .npz files ───────────────────────────────────────────────────────
+    # Save .npz files
     print("\n[4/5] Saving client .npz files...")
     for fd in fd_keys:
         path = os.path.join(output_dir, f"{fd}.npz")
@@ -294,7 +294,7 @@ def main():
         size_mb = os.path.getsize(path) / 1e6
         print(f"  {path}  ({size_mb:.1f} MB)")
 
-    # ── Figures ───────────────────────────────────────────────────────────────
+    # Figures
     print("\n[5/5] Generating figures...")
     plot_noniid(clients, fig_dir)
     plot_hi(clients, fig_dir)
