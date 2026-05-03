@@ -152,13 +152,18 @@ def train(cfg: dict, seed: int, epochs: int) -> dict:
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--config", default="config.yaml")
-    parser.add_argument("--seed",   type=int, default=None,
-                        help="Single seed. If omitted, runs all 5 seeds from config.")
-    parser.add_argument("--epochs", type=int, default=None)
+    parser.add_argument("--seed",      type=int, default=None,
+                        help="Single seed override.")
+    parser.add_argument("--all_seeds", action="store_true",
+                        help="Run all 5 seeds from config (same as omitting --seed).")
+    parser.add_argument("--epochs",    type=int, default=None)
     args = parser.parse_args()
 
-    cfg    = load_config(args.config)
-    seeds  = [args.seed] if args.seed else cfg["evaluation"]["seeds"]
+    cfg = load_config(args.config)
+    if args.seed is not None:
+        seeds = [args.seed]
+    else:
+        seeds = cfg["evaluation"]["seeds"]
     epochs = args.epochs or cfg["training"]["epochs_local"] * cfg["federation"]["num_rounds"]
 
     csv_path = os.path.join(cfg["evaluation"]["results_dir"], "centralised.csv")
