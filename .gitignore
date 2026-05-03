@@ -1,0 +1,89 @@
+# =========================
+# Python
+# =========================
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Virtual environments
+venv/
+.venv/
+env/
+ENV/
+
+# =========================
+# Jupyter Notebook
+# =========================
+.ipynb_checkpoints/
+*.nbconvert.ipynb
+
+# =========================
+# Data (IMPORTANT)
+# =========================
+data/
+datasets/
+*.csv
+*.txt
+*.zip
+*.tar
+*.gz
+
+# =========================
+# Model weights & checkpoints
+# =========================
+*.pt
+*.pth
+*.ckpt
+checkpoints/
+models/
+
+# =========================
+# datas & outputs
+# =========================
+logs/
+runs/
+results/
+*.data
+!data/sample/
+*.out
+
+# TensorBoard
+events.out.tfevents.*
+
+# =========================
+# Kaggle / temp
+# =========================
+/kaggle/
+*.tmp
+
+# =========================
+# IDE / Editor
+# =========================
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# =========================
+# OS files
+# =========================
+.DS_Store
+Thumbs.db
+
+# =========================
+# Misc
+# =========================
+*.pkl
+*.pickle
+*.joblib
+*.h5
+*.npy
+*.npz
+
+# =========================
+# Secrets (VERY IMPORTANT)
+# =========================
+.env
+*.env
+*.key
+*.pem
