@@ -16,6 +16,7 @@ Usage:
 """
 
 import argparse
+import multiprocessing
 import os
 import random
 import sys
@@ -26,6 +27,7 @@ import numpy as np
 import torch
 import torch.nn as nn
 import yaml
+from torch.amp import GradScaler, autocast
 from torch.optim import AdamW
 from torch.optim.lr_scheduler import CosineAnnealingLR
 
@@ -33,9 +35,31 @@ from evaluate import compute_metrics, evaluate, log_results, make_loader, mc_pre
 from models.loss import build_criterion
 from models.tcn import build_model
 
+# Number of DataLoader workers
+# Capped at 8 to avoid excessive RAM pressure; tune down if OOM.
+NUM_WORKERS: int = min(8, multiprocessing.cpu_count())
+
+
+# CUDA backend flags
+def configure_cuda() -> None:
+    """
+    Enable kernel auto-tuning and TF32 math.
+
+    cudnn.benchmark  – profiles conv kernels on first batch and picks the
+                       fastest implementation for your exact input shape.
+                       Disable if input shapes vary wildly across batches.
+
+    allow_tf32       – uses 10-bit mantissa (vs 23-bit FP32) for matmuls
+                       and convolutions on Ampere+ GPUs (~2× throughput,
+                       negligible accuracy loss for RUL regression).
+    """
+    torch.backends.cudnn.benchmark          = True
+    torch.backends.cuda.matmul.allow_tf32   = True
+    torch.backends.cudnn.allow_tf32         = True
+
 
 # Reproducibility
-def set_seeds(seed: int):
+def set_seeds(seed: int) -> None:
     random.seed(seed)
     np.random.seed(seed)
     torch.manual_seed(seed)
@@ -70,16 +94,27 @@ def load_all_clients(cfg: dict) -> tuple[np.ndarray, np.ndarray, dict]:
     )
 
 
-# Training function
+# Training
 def train(cfg: dict, seed: int, epochs: int) -> dict:
     set_seeds(seed)
+    configure_cuda()
+
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    print(f"\n[Centralised]  seed={seed}  device={device}  epochs={epochs}")
+    use_amp = device.type == "cuda"          # AMP is only beneficial on GPU
+    print(f"\n[Centralised]  seed={seed}  device={device}  "
+          f"epochs={epochs}  AMP={use_amp}  workers={NUM_WORKERS}")
 
     # Data
     X_train, y_train, test_data = load_all_clients(cfg)
     train_loader = make_loader(
-        X_train, y_train, cfg["training"]["batch_size"], shuffle=True
+        X_train,
+        y_train,
+        cfg["training"]["batch_size"],
+        shuffle=True,
+        num_workers=NUM_WORKERS,
+        pin_memory=True,            # async page-locked CPU→GPU DMA
+        prefetch_factor=2,          # prefetch 2 batches per worker
+        persistent_workers=True,    # keep worker processes alive between epochs
     )
     print(f"  Train: {X_train.shape}  |  Clients: {list(test_data.keys())}")
 
@@ -91,7 +126,8 @@ def train(cfg: dict, seed: int, epochs: int) -> dict:
         lr           = cfg["training"]["learning_rate"],
         weight_decay = cfg["training"]["weight_decay"],
     )
-    sched = CosineAnnealingLR(opt, T_max=epochs)
+    sched  = CosineAnnealingLR(opt, T_max=epochs)
+    scaler = GradScaler(enabled=use_amp)    # loss scaler for stable FP16 grads
 
     # Training loop
     for epoch in range(1, epochs + 1):
@@ -99,13 +135,24 @@ def train(cfg: dict, seed: int, epochs: int) -> dict:
         total_loss = 0.0
 
         for X_b, y_b in train_loader:
-            X_b, y_b = X_b.to(device), y_b.to(device)
+            # non_blocking=True overlaps H2D transfer with CPU work
+            X_b = X_b.to(device, non_blocking=True)
+            y_b = y_b.to(device, non_blocking=True)
+
             opt.zero_grad()
-            rul_pred, hi_seq = model.forward_with_hi(X_b)
-            loss, _          = criterion(rul_pred, y_b, hi_seq)
-            loss.backward()
+
+            # FP16 forward pass under AMP context
+            with autocast(device_type=device.type, enabled=use_amp):
+                rul_pred, hi_seq = model.forward_with_hi(X_b)
+                loss, _          = criterion(rul_pred, y_b, hi_seq)
+
+            # Scaled backward + unscale before clipping
+            scaler.scale(loss).backward()
+            scaler.unscale_(opt)
             nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-            opt.step()
+            scaler.step(opt)
+            scaler.update()
+
             total_loss += loss.item()
 
         sched.step()
@@ -120,7 +167,15 @@ def train(cfg: dict, seed: int, epochs: int) -> dict:
     all_preds, all_trues = [], []
 
     for fd, (X_test, y_test) in test_data.items():
-        loader = make_loader(X_test, y_test, cfg["training"]["batch_size"])
+        loader = make_loader(
+            X_test,
+            y_test,
+            cfg["training"]["batch_size"],
+            num_workers=NUM_WORKERS,
+            pin_memory=True,
+            prefetch_factor=2,
+            persistent_workers=True,
+        )
 
         # Deterministic metrics
         m_det = evaluate(model, loader, device)
@@ -141,7 +196,7 @@ def train(cfg: dict, seed: int, epochs: int) -> dict:
         results[f"{fd}_phm"]  = round(m_det["phm_score"], 2)
         results[f"{fd}_unc"]  = round(float(std_pred.mean()), 4)
 
-    # Overall metrics across all clients
+    # Overall metrics
     overall = compute_metrics(
         np.concatenate(all_preds),
         np.concatenate(all_trues),
@@ -179,11 +234,9 @@ def main():
 
     cfg = load_config(args.config)
 
-    # Seed selection logic
     if args.seed is not None:
         seeds = [args.seed]
     else:
-        # --all_seeds flag OR no flag → run full 5-seed suite
         seeds = cfg["evaluation"]["seeds"]
 
     # Default epoch count: local_epochs × num_rounds (equivalent FL budget)
