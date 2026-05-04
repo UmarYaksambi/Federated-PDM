@@ -43,6 +43,7 @@ def make_loader(
     shuffle:    bool = False,
     num_workers: int = 0,
     persistent_workers: bool = False,
+    **kwargs
 ) -> DataLoader:
     return DataLoader(
         CMAPSSDataset(X, y),
@@ -50,7 +51,8 @@ def make_loader(
         shuffle    = shuffle,
         num_workers= num_workers,
         persistent_workers= persistent_workers,
-        pin_memory = torch.cuda.is_available(),
+        pin_memory = kwargs.pop('pin_memory', torch.cuda.is_available()),
+        **kwargs
     )
 
 

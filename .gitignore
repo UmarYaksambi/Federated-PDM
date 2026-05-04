@@ -22,7 +22,8 @@ ENV/
 # =========================
 data/
 datasets/
-client_data/         # Created by preprocess.py (contains large .npz and figures)
+client_data/*         # Created by preprocess.py (contains large .npz and figures)
+client_data/**
 results/             # Evaluation metrics and logs
 *.csv
 *.txt
