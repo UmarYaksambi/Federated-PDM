@@ -36,7 +36,7 @@ training:
   epochs_local: 5           # local training epochs per FL round
   batch_size: 64
   learning_rate: 0.001
-  weight_decay: 1e-4
+  weight_decay: 1.0e-4
   lr_scheduler: "cosine"    # cosine annealing
 
 federation:
