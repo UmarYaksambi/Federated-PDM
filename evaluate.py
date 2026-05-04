@@ -41,12 +41,15 @@ def make_loader(
     y:          np.ndarray,
     batch_size: int,
     shuffle:    bool = False,
+    num_workers: int = 0,
+    persistent_workers: bool = False,
 ) -> DataLoader:
     return DataLoader(
         CMAPSSDataset(X, y),
         batch_size = batch_size,
         shuffle    = shuffle,
-        num_workers= 0,
+        num_workers= num_workers,
+        persistent_workers= persistent_workers,
         pin_memory = torch.cuda.is_available(),
     )
 
