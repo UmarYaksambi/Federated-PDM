@@ -37,7 +37,7 @@ from models.tcn import build_model
 
 # Number of DataLoader workers
 # Capped at 8 to avoid excessive RAM pressure; tune down if OOM.
-NUM_WORKERS: int = min(8, multiprocessing.cpu_count())
+NUM_WORKERS: int = min(1, multiprocessing.cpu_count())
 
 
 # CUDA backend flags
