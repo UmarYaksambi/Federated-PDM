@@ -26,7 +26,7 @@ model:
   num_levels: 4             # TCN dilation levels: 1, 2, 4, 8
   kernel_size: 3
   dropout: 0.2              # applied during training AND MC-Dropout inference
-  mc_samples: 50            # forward passes for uncertainty estimation
+  mc_samples: 5             # forward passes for uncertainty estimation
 
 loss:
   lambda_physics: 0.1       # weight of monotonicity constraint in hybrid loss

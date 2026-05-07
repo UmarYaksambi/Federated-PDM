@@ -281,6 +281,8 @@ def run(cfg: dict, mode: str, seed: int) -> dict:
     # Load actual trained global model
     final_model = _load_final_model(cfg, strategy.last_params, device)
 
+    torch.cuda.empty_cache()
+    
     # Per-client final evaluation with MC-Dropout
     print("\n  Final per-client evaluation (MC-Dropout on trained global model):")
     results_row  = {"experiment": mode, "seed": seed}
