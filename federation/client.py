@@ -23,6 +23,7 @@ import numpy as np
 import torch
 import torch.nn as nn
 import yaml
+from flwr.common import Context          # FIX 4: needed for updated client_fn signature
 from torch.optim import AdamW
 from torch.optim.lr_scheduler import CosineAnnealingLR
 
@@ -99,16 +100,30 @@ class PDMClient(fl.client.NumPyClient):
               f"sim={'on' if use_simulation else 'off'}  "
               f"fedprox={'on' if use_fedprox else 'off'}")
 
+    # ------------------------------------------------------------------ #
     # Flower interface
+    # ------------------------------------------------------------------ #
 
     def get_parameters(self, config: dict) -> list[np.ndarray]:
-        return [p.cpu().numpy() for p in self.model.parameters()]
+        # FIX 1 + 2: use state_dict().values() instead of model.parameters().
+        #
+        # model.parameters() only yields *trainable* tensors and still carries
+        # requires_grad=True, so calling .numpy() on them raises:
+        #   RuntimeError: Can't call numpy() on Tensor that requires grad.
+        #
+        # state_dict() includes ALL tensors (parameters + buffers such as
+        # BatchNorm running stats or weight_norm pre-hook tensors) and returns
+        # them already detached from the autograd graph, so .numpy() works
+        # directly.  Using state_dict() here keeps get/set_parameters and
+        # _load_final_model in train_federated.py consistent with each other.
+        return [val.cpu().numpy() for val in self.model.state_dict().values()]
 
-    def set_parameters(self, parameters: list[np.ndarray]):
-        state_dict = self.model.state_dict()
+    def set_parameters(self, parameters: list[np.ndarray]) -> None:
+        # FIX 2 (continued): zip against state_dict keys — matches get_parameters.
+        params_dict = zip(self.model.state_dict().keys(), parameters)
         new_state = {
             k: torch.tensor(v, dtype=torch.float32).to(self.device)
-            for k, v in zip(state_dict.keys(), parameters)
+            for k, v in params_dict
         }
         self.model.load_state_dict(new_state, strict=True)
 
@@ -177,7 +192,11 @@ class PDMClient(fl.client.NumPyClient):
         return (
             self.get_parameters({}),
             len(X_tr),
-            {"train_loss": total_loss, "n_samples": len(X_tr)},
+            # "fd" is included so SimilarityWeightedStrategy.aggregate_fit()
+            # can look up the correct per-client weight without relying on
+            # proxy.cid, which is a large hash in Flower >= 1.x simulation
+            # mode and is NOT a sequential 0..N-1 index.
+            {"train_loss": total_loss, "n_samples": len(X_tr), "fd": self.fd},
         )
 
     def evaluate(
@@ -204,7 +223,9 @@ class PDMClient(fl.client.NumPyClient):
         return float(m["rmse"]), len(self.X_test), m
 
 
+# ------------------------------------------------------------------ #
 # Client factory for Flower simulation
+# ------------------------------------------------------------------ #
 
 def make_client_fn(
     cfg:            dict,
@@ -213,19 +234,32 @@ def make_client_fn(
     device:         torch.device,
 ):
     """
-    Returns a Flower-compatible client_fn(cid: str) → NumPyClient.
-    Flower passes the client index as a string; we map it to an FD key.
+    Returns a Flower-compatible client_fn(context: Context) → Client.
+
+    FIX 4: Flower's newer versions expect:
+      - client_fn(context: Context) signature (not cid: str)
+      - return type Client, not NumPyClient
+        (call .to_client() to convert NumPyClient → Client)
+
+    In simulation mode the virtual-client index is available via
+    context.node_config["partition-id"] when Flower sets it, with a
+    fallback to context.node_id for older builds.
     """
     fd_keys = cfg["data"]["clients"]
 
-    def client_fn(cid: str) -> PDMClient:
-        fd = fd_keys[int(cid)]
+    def client_fn(context: Context) -> fl.client.Client:
+        # partition-id is set by Flower's VCE in newer releases;
+        # node_id (int) is the reliable fallback for start_simulation().
+        partition_id = context.node_config.get(
+            "partition-id", int(context.node_id)
+        )
+        fd = fd_keys[int(partition_id) % len(fd_keys)]
         return PDMClient(
             fd             = fd,
             cfg            = cfg,
             use_simulation = use_simulation,
             use_fedprox    = use_fedprox,
             device         = device,
-        )
+        ).to_client()   # NumPyClient → Client (required by current Flower)
 
     return client_fn

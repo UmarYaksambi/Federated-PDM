@@ -123,7 +123,7 @@ class FedProxStrategy(_BaseCustomStrategy):
         agg   = _weighted_average(params_list, ws)
         metrics = _aggregate_fit_metrics(
             [(n, fit_res.metrics)
-             for _, fit_res in results if fit_res.metrics]
+             for _, fit_res in results if fit_res.metrics is not None]
         )
         return ndarrays_to_parameters(agg), metrics
 
@@ -164,17 +164,27 @@ class SimilarityWeightedStrategy(_BaseCustomStrategy):
         """
         Compute static client weights from the pre-computed KL matrix.
         Clients are weighted once before training starts and held fixed.
+
+        Stored as a dict keyed by fd string (e.g. "FD001") so that
+        aggregate_fit() can look up weights via fit_res.metrics["fd"]
+        instead of proxy.cid.  proxy.cid in Flower >= 1.x simulation is
+        a large hash integer, NOT a sequential 0..N-1 index — indexing
+        self.weights[int(proxy.cid)] was the direct cause of:
+          IndexError: index 7310881596489040937 is out of bounds for axis 0
         """
-        mean_kl = np.array([
-            kl_matrix.loc[fd, [f for f in self.fd_keys if f != fd]].mean()
+        mean_kl = {
+            fd: kl_matrix.loc[fd, [f for f in self.fd_keys if f != fd]].mean()
             for fd in self.fd_keys
-        ])
-        similarities  = np.exp(-mean_kl)
-        self.weights  = similarities / similarities.sum()   # sums to 1
+        }
+        similarities = {fd: np.exp(-mean_kl[fd]) for fd in self.fd_keys}
+        total = sum(similarities.values())
+        # weights_dict: fd → normalised aggregation weight (sums to 1)
+        self.weights_dict = {fd: sim / total for fd, sim in similarities.items()}
 
         print("\n[SimilarityWeighted] Aggregation weights (from KL matrix):")
-        for fd, w, kl in zip(self.fd_keys, self.weights, mean_kl):
-            print(f"  {fd}: weight={w:.4f}  (mean_KL={kl:.4f})")
+        for fd in self.fd_keys:
+            print(f"  {fd}: weight={self.weights_dict[fd]:.4f}"
+                  f"  (mean_KL={mean_kl[fd]:.4f})")
 
     def aggregate_fit(
         self,
@@ -185,20 +195,30 @@ class SimilarityWeightedStrategy(_BaseCustomStrategy):
         if not results:
             return None, {}
 
-        # Build (params, n_samples, orig_weight) triples
+        # Build (params, n_samples, orig_weight) triples.
+        #
+        # FIX: We look up weights via fit_res.metrics["fd"] — the fd string
+        # that client.py now includes in every fit() return metrics dict.
+        # This replaces the broken int(proxy.cid) index lookup: proxy.cid in
+        # Flower >= 1.x simulation is a large hash (not 0..N-1), so
+        # self.weights[int(proxy.cid)] raised IndexError.
+        fallback_w = 1.0 / len(self.fd_keys)   # equal weight if fd missing
         client_data = []
         for proxy, fit_res in results:
-            params   = parameters_to_ndarrays(fit_res.parameters)
-            n        = fit_res.num_examples
-            cid      = int(proxy.cid)
-            orig_w   = self.weights[cid]
+            params = parameters_to_ndarrays(fit_res.parameters)
+            n      = fit_res.num_examples
+            fd     = (fit_res.metrics or {}).get("fd", "")
+            orig_w = self.weights_dict.get(fd, fallback_w)
+            if not fd:
+                print(f"  [WARN] SimilarityWeighted: no 'fd' in metrics for "
+                      f"proxy.cid={proxy.cid}; using equal weight={fallback_w:.4f}")
             client_data.append((params, n, orig_w))
 
         # Renormalise in case fewer than min_clients responded
-        raw_weights = np.array([orig_w for _, _, orig_w in client_data])
-        norm_weights = raw_weights / raw_weights.sum()   # ← explicit rename
+        raw_weights  = np.array([orig_w for _, _, orig_w in client_data])
+        norm_weights = raw_weights / raw_weights.sum()
 
-        # Weighted average — norm_weights and orig_w are now distinct names
+        # Weighted average
         n_layers = len(client_data[0][0])
         agg = [
             sum(
@@ -209,9 +229,10 @@ class SimilarityWeightedStrategy(_BaseCustomStrategy):
             for i in range(n_layers)
         ]
 
+        # Bug 4 fix: use "is not None" — empty dict {} is falsy but valid
         metrics = _aggregate_fit_metrics(
             [(n, fit_res.metrics)
-             for _, fit_res in results if fit_res.metrics]
+             for _, fit_res in results if fit_res.metrics is not None]
         )
         return ndarrays_to_parameters(agg), metrics
 
@@ -222,7 +243,12 @@ def _aggregate_fit_metrics(metrics: list[tuple[int, dict]]) -> dict:
     if not metrics:
         return {}
     total = sum(n for n, _ in metrics)
-    keys  = metrics[0][1].keys()
+    # Skip non-numeric fields (e.g. "fd" string tag added by clients so the
+    # server can identify sub-datasets without relying on proxy.cid hashes).
+    keys = [
+        k for k in metrics[0][1].keys()
+        if isinstance(metrics[0][1][k], (int, float))
+    ]
     return {k: sum(n * m[k] for n, m in metrics) / total for k in keys}
 
 
@@ -230,7 +256,10 @@ def _aggregate_eval_metrics(metrics: list[tuple[int, dict]]) -> dict:
     if not metrics:
         return {}
     total = sum(n for n, _ in metrics)
-    keys  = metrics[0][1].keys()
+    keys = [
+        k for k in metrics[0][1].keys()
+        if isinstance(metrics[0][1][k], (int, float))
+    ]
     return {
         k: sum(n * m[k] for n, m in metrics if k in m) / total
         for k in keys

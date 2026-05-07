@@ -36,7 +36,10 @@ from models.tcn import build_model
 NUM_WORKERS: int = min(8, multiprocessing.cpu_count())
 
 
+# ------------------------------------------------------------------ #
 # CUDA backend flags
+# ------------------------------------------------------------------ #
+
 def configure_cuda() -> None:
     """
     Enable kernel auto-tuning and TF32 math globally for this process.
@@ -50,7 +53,10 @@ def configure_cuda() -> None:
     torch.backends.cudnn.allow_tf32         = True
 
 
+# ------------------------------------------------------------------ #
 # Reproducibility
+# ------------------------------------------------------------------ #
+
 def set_seeds(seed: int) -> None:
     random.seed(seed)
     np.random.seed(seed)
@@ -73,7 +79,10 @@ MODE_CONFIG = {
 }
 
 
+# ------------------------------------------------------------------ #
 # Strategy decorator
+# ------------------------------------------------------------------ #
+
 class _TrackingStrategy(fl.server.strategy.Strategy):
     """
     Decorator pattern wrapper around any Flower strategy.
@@ -122,15 +131,21 @@ class _TrackingStrategy(fl.server.strategy.Strategy):
                 kv = "  ".join(
                     f"{k}={v:.4f}" for k, v in record.items() if k != "round"
                 )
-                print(
-                    f"  Round {server_round:>3}/{self._w.cfg.get('num_rounds', '?')}  {kv}"
-                    if hasattr(self._w, "cfg") else
-                    f"  Round {server_round:>3}  {kv}"
-                )
+                # cfg["federation"]["num_rounds"] — NOT top-level cfg["num_rounds"]
+                if hasattr(self._w, "cfg"):
+                    total_rounds = self._w.cfg.get("federation", {}).get(
+                        "num_rounds", "?"
+                    )
+                else:
+                    total_rounds = "?"
+                print(f"  Round {server_round:>3}/{total_rounds}  {kv}")
         return loss, metrics
 
 
+# ------------------------------------------------------------------ #
 # Load final FL model
+# ------------------------------------------------------------------ #
+
 def _load_final_model(
     cfg:    dict,
     params: list[np.ndarray],
@@ -141,14 +156,21 @@ def _load_final_model(
 
     Tensors are placed directly on `device` with non_blocking=True so the
     H2D transfer is overlapped with any subsequent CPU work.
+
+    NOTE: `params` must be built from state_dict().values() (which includes
+    both trainable parameters *and* buffers), matching how client.py's
+    get_parameters() serialises the model.  Using model.parameters() on
+    either side would silently drop buffers and misalign the mapping.
     """
     model = build_model(cfg).to(device)
     state_dict = model.state_dict()
 
     if len(params) != len(state_dict):
         raise ValueError(
-            f"Parameter count mismatch: model has {len(state_dict)} tensors "
-            f"but received {len(params)} from FL training."
+            f"Parameter count mismatch: model state_dict has {len(state_dict)} "
+            f"tensors but received {len(params)} from FL training. "
+            f"Ensure get_parameters() uses state_dict().values(), not "
+            f"model.parameters()."
         )
 
     new_state = {
@@ -159,7 +181,10 @@ def _load_final_model(
     return model
 
 
+# ------------------------------------------------------------------ #
 # Main training + evaluation
+# ------------------------------------------------------------------ #
+
 def run(cfg: dict, mode: str, seed: int) -> dict:
     set_seeds(seed)
     configure_cuda()
@@ -181,33 +206,58 @@ def run(cfg: dict, mode: str, seed: int) -> dict:
     )
 
     # Build initial model + strategy
-    init_model  = build_model(cfg)
-    init_params = [p.detach().numpy() for p in init_model.parameters()]
+    init_model = build_model(cfg)
+
+    # FIX 3: use state_dict().values() to serialise initial params.
+    #
+    # model.parameters() only yields trainable tensors and excludes buffers
+    # (e.g. BatchNorm running stats, weight_norm pre-hook tensors).
+    # state_dict().values() includes ALL tensors, matching what client.py's
+    # get_parameters() / set_parameters() and _load_final_model() expect.
+    # Mismatching the two sides silently corrupts buffer values every round.
+    init_params = [val.detach().cpu().numpy()
+                   for val in init_model.state_dict().values()]
 
     base_strategy = build_strategy(strategy_name, cfg, init_params)
     strategy      = _TrackingStrategy(base_strategy)
 
     # Client factory
-    # Pass use_amp and NUM_WORKERS so the client's inner training loop also
-    # benefits from mixed-precision and fast data loading.
     client_fn = make_client_fn(
         cfg,
         use_simulation,
         use_fedprox,
         device,
-        use_amp=use_amp,
-        num_workers=NUM_WORKERS,
     )
 
-    # GPU allocation per virtual client
-    # Dividing 1 GPU across num_clients lets Ray run all virtual clients on the
-    # same physical GPU concurrently instead of leaving it idle.
-    # If you have multiple physical GPUs, set num_gpus=1.0 to give each client
-    # a dedicated GPU and let Ray schedule them across devices.
-    gpu_fraction = (1.0 / num_clients) if torch.cuda.is_available() else 0.0
+    # GPU allocation for Ray virtual client engine (VCE).
+    #
+    # On Windows, Ray cannot manage CUDA resources at all.  Passing any
+    # non-zero num_gpus causes Ray worker registration to fail with:
+    #   core_worker_process.cc: Failed to register worker to Raylet:
+    #   IOError: Unknown error
+    # This is a known Ray limitation on Windows — CUDA context sharing via
+    # Ray's resource scheduler only works on Linux/macOS.
+    #
+    # The correct Windows approach is num_gpus=0 so Ray does zero GPU
+    # bookkeeping.  Each PDMClient receives the `device` object
+    # (torch.device("cuda")) and moves tensors there with .to(device) —
+    # PyTorch manages GPU access independently of Ray's resource tracking,
+    # so training still runs fully on the RTX 3050.
+    #
+    # On Linux with a single GPU use 1.0/num_clients (fractional scheduling);
+    # with multiple GPUs use 1.0 to give each virtual client an exclusive GPU.
+    if sys.platform == "win32":
+        gpu_fraction = 0.0   # Ray GPU management unsupported on Windows
+    elif torch.cuda.is_available():
+        gpu_fraction = 1.0 / num_clients   # fractional share on Linux/macOS
+    else:
+        gpu_fraction = 0.0
 
-    print(f"  Client resources: cpus=2  gpus={gpu_fraction:.4f} "
-          f"({'shared' if gpu_fraction < 1.0 else 'dedicated'} GPU)")
+    if sys.platform == "win32":
+        gpu_note = "Ray GPU mgmt disabled on Windows; PyTorch uses CUDA directly"
+    else:
+        gpu_note = f"1/{num_clients} GPU share per virtual client"
+    print(f"  Client resources: cpus=2  gpus={gpu_fraction:.4f}  ({gpu_note})")
 
     # Federated simulation
     fl.simulation.start_simulation(
@@ -216,8 +266,8 @@ def run(cfg: dict, mode: str, seed: int) -> dict:
         config           = fl.server.ServerConfig(num_rounds=num_rounds),
         strategy         = strategy,
         client_resources = {
-            "num_cpus": 2,              # 2 CPUs per virtual client for workers
-            "num_gpus": gpu_fraction,   # fractional GPU share
+            "num_cpus": 2,
+            "num_gpus": gpu_fraction,
         },
     )
 
@@ -298,7 +348,10 @@ def run(cfg: dict, mode: str, seed: int) -> dict:
     return results_row
 
 
+# ------------------------------------------------------------------ #
 # Entry point
+# ------------------------------------------------------------------ #
+
 def main():
     parser = argparse.ArgumentParser(
         description="Federated PdM experiments (E2=fedavg, E3=fedprox, E4=proposed)"
