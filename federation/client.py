@@ -51,12 +51,16 @@ class PDMClient(fl.client.NumPyClient):
         use_simulation: bool         = True,
         use_fedprox:    bool         = False,
         device:         torch.device = torch.device("cpu"),
+        use_amp:        bool         = False,
+        num_workers:    int          = 0,
     ):
         self.fd             = fd
         self.cfg            = cfg
         self.use_simulation = use_simulation
         self.use_fedprox    = use_fedprox
         self.device         = device
+        self.use_amp        = use_amp
+        self.num_workers    = num_workers
 
         train_cfg       = cfg["training"]
         self.epochs     = train_cfg["epochs_local"]
@@ -145,11 +149,14 @@ class PDMClient(fl.client.NumPyClient):
         else:
             X_tr, y_tr = self.X_train, self.y_train
 
-        loader = make_loader(X_tr, y_tr, self.batch_size, shuffle=True)
+        loader = make_loader(
+            X_tr, y_tr, self.batch_size, shuffle=True, num_workers=self.num_workers
+        )
 
         # Local optimisation
         opt   = AdamW(self.model.parameters(), lr=self.lr, weight_decay=self.wd)
         sched = CosineAnnealingLR(opt, T_max=self.epochs)
+        scaler = torch.amp.GradScaler(enabled=self.use_amp)
         self.model.train()
 
         total_loss = 0.0
@@ -160,15 +167,19 @@ class PDMClient(fl.client.NumPyClient):
                 y_batch = y_batch.to(self.device)
 
                 opt.zero_grad()
-                rul_pred, hi_seq = self.model.forward_with_hi(X_batch)
-                loss, _          = self.criterion(rul_pred, y_batch, hi_seq)
 
-                if self.use_fedprox:
-                    loss = self.fedprox_loss(loss, self.model, global_params)
+                with torch.amp.autocast(device_type=self.device.type, enabled=self.use_amp):
+                    rul_pred, hi_seq = self.model.forward_with_hi(X_batch)
+                    loss, _          = self.criterion(rul_pred, y_batch, hi_seq)
 
-                loss.backward()
+                    if self.use_fedprox:
+                        loss = self.fedprox_loss(loss, self.model, global_params)
+
+                scaler.scale(loss).backward()
+                scaler.unscale_(opt)
                 nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
-                opt.step()
+                scaler.step(opt)
+                scaler.update()
                 epoch_loss += loss.item()
 
             sched.step()
@@ -211,6 +222,8 @@ def make_client_fn(
     use_simulation: bool,
     use_fedprox:    bool,
     device:         torch.device,
+    use_amp:        bool = False,
+    num_workers:    int  = 0,
 ):
     """
     Returns a Flower-compatible client_fn(cid: str) → NumPyClient.
@@ -226,6 +239,8 @@ def make_client_fn(
             use_simulation = use_simulation,
             use_fedprox    = use_fedprox,
             device         = device,
+            use_amp        = use_amp,
+            num_workers    = num_workers,
         )
 
     return client_fn

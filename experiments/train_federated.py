@@ -165,7 +165,7 @@ def run(cfg: dict, mode: str, seed: int) -> dict:
     configure_cuda()
 
     device  = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    use_amp = device.type == "cuda"
+    use_amp = device.type == "cpu"
 
     use_simulation, use_fedprox, strategy_name = MODE_CONFIG[mode]
     num_clients = len(cfg["data"]["clients"])
