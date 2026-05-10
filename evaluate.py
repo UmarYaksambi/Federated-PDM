@@ -156,29 +156,40 @@ def mc_predict(
         std_pred:  (N,) — epistemic uncertainty
         true_rul:  (N,) — ground truth labels
     """
-    model.train()   # dropout ON
+    model.train()
 
-    # Collect all inputs in one pass
-    all_X, all_y = [], []
+    mean_preds = []
+    std_preds  = []
+    true_ruls  = []
+
     with torch.no_grad():
-        for X, y in loader:
-            all_X.append(X)
-            all_y.append(y)
-    all_X    = torch.cat(all_X, dim=0).to(device)   # (N, T, F)
-    true_rul = torch.cat(all_y, dim=0).numpy()        # (N,)
+        for X_batch, y_batch in loader:
 
-    # n_samples stochastic forward passes
-    run_preds = []
-    with torch.no_grad():
-        for _ in range(n_samples):
-            run_preds.append(model(all_X).cpu().numpy())   # (N,)
+            X_batch = X_batch.to(device, non_blocking=True)
 
-    run_preds = np.stack(run_preds, axis=0)   # (n_samples, N)
-    mean_pred = run_preds.mean(axis=0)         # (N,)
-    std_pred  = run_preds.std(axis=0)          # (N,)
+            batch_preds = []
 
-    model.eval()   # restore eval mode
-    return mean_pred, std_pred, true_rul
+            for _ in range(n_samples):
+                preds = model(X_batch)
+                batch_preds.append(preds.detach().cpu().numpy())
+
+            batch_preds = np.stack(batch_preds, axis=0)
+
+            mean_preds.append(batch_preds.mean(axis=0))
+            std_preds.append(batch_preds.std(axis=0))
+            true_ruls.append(y_batch.numpy())
+
+            del preds
+            del batch_preds
+            torch.cuda.empty_cache()
+
+    model.eval()
+
+    return (
+        np.concatenate(mean_preds),
+        np.concatenate(std_preds),
+        np.concatenate(true_ruls),
+    )
 
 
 # CSV logging
