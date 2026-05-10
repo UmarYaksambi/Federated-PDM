@@ -6,31 +6,43 @@ Flower federated learning client.
 Each client:
   1. Loads its own preprocessed data partition (FD001–FD004)
   2. Optionally augments training data with Weibull synthetic trajectories
-  3. Trains locally for N epochs using hybrid loss (or plain MSE)
+  3. Trains locally for N epochs using hybrid loss
   4. Returns updated parameters + metrics to the server
 
-Supports three modes controlled by use_simulation / use_fedprox:
-  Vanilla FedAvg:          use_simulation=False, use_fedprox=False
-  Proposed (sim + SW-Agg): use_simulation=True,  use_fedprox=False
-  FedProx baseline:        use_simulation=False,  use_fedprox=True
+FIXES IN THIS VERSION
+=====================
+Fix 1 — Round-specific augmentation seed
+  Original code: rng = np.random.default_rng(cfg["seed"])
+  Problem: identical shuffle every round → clients see identical data
+  order each round, reinforcing the same local bias.
+  Fixed: seed = base_seed + round_num * large_prime, giving a unique
+  permutation each round while still being reproducible.
 
-CHANGES vs original:
-  - AMP (Automatic Mixed Precision) support via torch.amp.
-    Enabled automatically when device is CUDA.  Gives ~1.5–2× speedup
-    on RTX/T4 with negligible loss in RUL accuracy.
-  - use_amp flag propagated through make_client_fn.
-  - GradScaler created once per fit() call (safe for Flower simulation
-    which may reuse the same PDMClient object across rounds).
+Fix 2 — Inter-round learning rate decay (cosine across communication rounds)
+  Within each round the local optimiser already uses a cosine schedule
+  (CosineAnnealingLR over local epochs). But there is no decay across
+  the 50 communication rounds. Without it, clients take equally large
+  steps in round 50 as in round 1, driving client drift even as the
+  global model converges.
+
+  The server now passes {"round": r, "num_rounds": R} in fit_config.
+  We compute:
+    cos_factor   = 0.5 · (1 + cos(π · (r−1) / (R−1)))   ∈ [0, 1]
+    effective_lr = base_lr · (min_frac + (1−min_frac) · cos_factor)
+  where min_frac = 0.1, so LR decays from base_lr to 0.1·base_lr.
+
+AMP (Automatic Mixed Precision)
+  Enabled automatically when device is CUDA.  Gives ~1.5–2× speedup.
 """
 
 import json
+import math
 import os
 
 import flwr as fl
 import numpy as np
 import torch
 import torch.nn as nn
-import yaml
 from flwr.common import Context
 from torch.amp import GradScaler, autocast
 from torch.optim import AdamW
@@ -69,8 +81,8 @@ class PDMClient(fl.client.NumPyClient):
         self.use_simulation = use_simulation
         self.use_fedprox    = use_fedprox
         self.device         = device
-        # AMP only makes sense on CUDA; silently disabled on CPU
         self.use_amp        = use_amp and (device.type == "cuda")
+        self._base_seed     = cfg["reproducibility"]["seed"]
 
         train_cfg       = cfg["training"]
         self.epochs     = train_cfg["epochs_local"]
@@ -96,7 +108,7 @@ class PDMClient(fl.client.NumPyClient):
                 k    = params[fd]["k"],
                 lam  = params[fd]["lambda"],
                 cfg  = cfg,
-                seed = cfg["reproducibility"]["seed"],
+                seed = self._base_seed,
             )
 
         # Loss functions
@@ -135,41 +147,53 @@ class PDMClient(fl.client.NumPyClient):
         config:     dict,
     ) -> tuple[list[np.ndarray], int, dict]:
         """
-        FL round local training with AMP support.
+        FL round local training.
 
         Steps:
           1. Receive and load global model weights from server.
-          2. Snapshot global params for FedProx proximal term.
-          3. Optionally augment local data with Weibull synthetic windows.
-          4. Train for self.epochs with AdamW + cosine LR + AMP (if CUDA).
-          5. Return updated weights + training metrics.
+          2. Read round / num_rounds from server config for LR scheduling.
+          3. Snapshot global params for FedProx proximal term.
+          4. Optionally augment local data (round-specific seed — Fix 1).
+          5. Train with AdamW + inter-round LR decay (Fix 2) + AMP.
+          6. Return updated weights + training metrics.
         """
         self.set_parameters(parameters)
+
+        # ---- Fix 2: inter-round cosine LR decay ----
+        round_num    = int(config.get("round",      1))
+        total_rounds = int(config.get("num_rounds",
+                           self.cfg["federation"].get("num_rounds", 50)))
+
+        # Cosine decay: round 1 → base_lr, final round → 0.1 * base_lr
+        cos_factor   = 0.5 * (
+            1.0 + math.cos(math.pi * (round_num - 1) / max(total_rounds - 1, 1))
+        )
+        effective_lr = self.lr * (0.1 + 0.9 * cos_factor)
 
         # Snapshot global params before any local update (for FedProx)
         global_params = [p.clone().detach() for p in self.model.parameters()]
 
-        # Data augmentation
+        # ---- Data augmentation ----
         if self.use_simulation:
             X_sim, y_sim = self.simulator.generate(
                 n_trajectories=self.cfg["simulation"]["n_trajectories"]
             )
             X_tr = np.concatenate([self.X_train, X_sim], axis=0)
             y_tr = np.concatenate([self.y_train, y_sim], axis=0)
-            rng  = np.random.default_rng(self.cfg["reproducibility"]["seed"])
-            idx  = rng.permutation(len(X_tr))
+
+            # Fix 1: unique permutation each round, still reproducible
+            # Large prime multiplier spreads seeds well across rounds.
+            rng = np.random.default_rng(self._base_seed + round_num * 7_919)
+            idx = rng.permutation(len(X_tr))
             X_tr, y_tr = X_tr[idx], y_tr[idx]
         else:
             X_tr, y_tr = self.X_train, self.y_train
 
         loader = make_loader(X_tr, y_tr, self.batch_size, shuffle=True)
 
-        # Local optimisation
-        opt    = AdamW(self.model.parameters(), lr=self.lr, weight_decay=self.wd)
+        # ---- Local optimisation ----
+        opt    = AdamW(self.model.parameters(), lr=effective_lr, weight_decay=self.wd)
         sched  = CosineAnnealingLR(opt, T_max=self.epochs)
-        # GradScaler is created fresh each fit() call.
-        # enabled=False is a no-op (no overhead) when use_amp is False,
-        # so we can always construct it without an if-branch.
         scaler = GradScaler(enabled=self.use_amp)
         self.model.train()
 
@@ -182,15 +206,12 @@ class PDMClient(fl.client.NumPyClient):
 
                 opt.zero_grad()
 
-                # autocast is a no-op context when enabled=False
                 with autocast(device_type=self.device.type, enabled=self.use_amp):
                     rul_pred, hi_seq = self.model.forward_with_hi(X_batch)
                     loss, _          = self.criterion(rul_pred, y_batch, hi_seq)
                     if self.use_fedprox:
                         loss = self.fedprox_loss(loss, self.model, global_params)
 
-                # scaler.scale() is identity when enabled=False,
-                # so the same code path works for both CPU and GPU.
                 scaler.scale(loss).backward()
                 scaler.unscale_(opt)
                 nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
@@ -205,7 +226,12 @@ class PDMClient(fl.client.NumPyClient):
         return (
             self.get_parameters({}),
             len(X_tr),
-            {"train_loss": total_loss, "n_samples": len(X_tr), "fd": self.fd},
+            {
+                "train_loss": total_loss,
+                "n_samples":  len(X_tr),
+                "fd":         self.fd,
+                "lr":         effective_lr,   # visible in convergence CSV
+            },
         )
 
     def evaluate(
@@ -221,9 +247,10 @@ class PDMClient(fl.client.NumPyClient):
         preds, trues = [], []
         with torch.no_grad():
             for X, y in loader:
-                # Use AMP for eval too — same hardware, free speedup
                 with autocast(device_type=self.device.type, enabled=self.use_amp):
-                    preds.append(self.model(X.to(self.device)).cpu().float().numpy())
+                    preds.append(
+                        self.model(X.to(self.device)).cpu().float().numpy()
+                    )
                 trues.append(y.numpy())
 
         preds = np.concatenate(preds)
@@ -244,12 +271,7 @@ def make_client_fn(
     device:         torch.device,
     use_amp:        bool = True,
 ):
-    """
-    Returns a Flower-compatible client_fn(context: Context) → Client.
-
-    Args:
-        use_amp: enable AMP (passed through to PDMClient; auto-disabled on CPU)
-    """
+    """Returns a Flower-compatible client_fn(context: Context) → Client."""
     fd_keys = cfg["data"]["clients"]
 
     def client_fn(context: Context) -> fl.client.Client:

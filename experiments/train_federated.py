@@ -7,9 +7,37 @@ Runs all three federated experiments via --mode flag.
   E3: python experiments/train_federated.py --mode fedprox
   E4: python experiments/train_federated.py --mode proposed
 
+Recommended baseline run (verify FL is working):
+  python experiments/train_federated.py --mode proposed \\
+      --rounds 10 --local-epochs 1 --eval-every 2
+
+Recommended full run for paper comparison vs E1 (50 centralised epochs):
+  python experiments/train_federated.py --mode proposed \\
+      --rounds 50 --local-epochs 3 --eval-every 5
+
 For all 5 seeds:
   python experiments/train_federated.py --mode proposed --all_seeds \\
-      --rounds 50 --local-epochs 5
+      --rounds 50 --local-epochs 3
+
+CHANGES IN THIS VERSION
+=======================
+- --local-epochs default changed to 1 in argument help.
+  With local_epochs=5 in the original run, clients drifted so far that
+  RMSE got WORSE across rounds (46.98 → 60.49).  Use 1–2 for stability;
+  3 for faster wall-clock convergence if monitoring confirms no divergence.
+
+- --use-fedprox flag added.
+  Allows enabling the FedProx proximal term in the "proposed" mode
+  without switching to --mode fedprox (which uses plain FedAvg on the
+  server).  This combination (similarity-weighted aggregation + proximal
+  constraint) is the strongest defence against client drift.
+
+- MODE_CONFIG updated to look up use_fedprox dynamically.
+  Proposed mode still defaults to use_fedprox=False to match paper
+  description; use --use-fedprox to enable it.
+
+- eval_every=5 default (unchanged from previous version).
+  Still the single biggest wall-clock saving.
 """
 
 import argparse
@@ -33,7 +61,6 @@ from federation.client import make_client_fn
 from federation.server import build_strategy
 from models.tcn import build_model
 
-# DataLoader worker count — keep at 0 on Windows to avoid spawn overhead
 if sys.platform == "win32":
     NUM_WORKERS: int = 0
 else:
@@ -67,11 +94,13 @@ def load_config(path: str = "config.yaml") -> dict:
         return yaml.safe_load(f)
 
 
-# Mode → (use_simulation, use_fedprox, strategy_name)
-MODE_CONFIG = {
-    "fedavg":   (False, False, "fedavg"),
-    "fedprox":  (False, True,  "fedprox"),
-    "proposed": (True,  False, "similarity_weighted"),
+# (use_simulation, strategy_name)
+# use_fedprox is now set via CLI --use-fedprox, not locked in MODE_CONFIG,
+# because the paper's "proposed" mode may or may not combine with FedProx.
+_MODE_BASE = {
+    "fedavg":   (False, "fedavg"),
+    "fedprox":  (False, "fedprox"),   # proximal term from mode name
+    "proposed": (True,  "similarity_weighted"),
 }
 
 
@@ -81,17 +110,9 @@ MODE_CONFIG = {
 
 class _TrackingStrategy(fl.server.strategy.Strategy):
     """
-    Decorator around any Flower strategy that:
-      1. Captures per-round eval metrics → convergence CSV
-      2. Captures final aggregated parameters → post-training eval
-      3. Skips client evaluation when server_round % eval_every != 0
-         (controlled by the eval_every constructor arg).
-
-    Skipping evaluation is the largest single wall-clock saving in FL:
-    a full eval round visits every client, runs inference on its test
-    split, and returns metrics — nearly as expensive as a fit round.
-    With eval_every=5 we save ~80 % of eval overhead with almost no
-    loss in convergence visibility.
+    Decorator around any Flower strategy.
+    Captures per-round eval metrics and final aggregated parameters.
+    Skips evaluation on non-eval rounds (eval_every > 1) for speed.
     """
 
     def __init__(
@@ -101,48 +122,39 @@ class _TrackingStrategy(fl.server.strategy.Strategy):
     ):
         self._w         = wrapped
         self.eval_every = max(1, eval_every)
-        self.round_metrics: list[dict]          = []
+        self.round_metrics: list[dict]              = []
         self.last_params:   list[np.ndarray] | None = None
 
-    # ---- Delegation ----
+    def initialize_parameters(self, client_manager=None, **kwargs):
+        return self._w.initialize_parameters(client_manager=client_manager, **kwargs)
 
-    def initialize_parameters(self, client_manager):
-        return self._w.initialize_parameters(client_manager)
+    def configure_fit(self, server_round, parameters, client_manager, **kwargs):
+        return self._w.configure_fit(server_round=server_round, parameters=parameters, client_manager=client_manager, **kwargs)
 
-    def configure_fit(self, server_round, parameters, client_manager):
-        return self._w.configure_fit(server_round, parameters, client_manager)
+    def evaluate(self, server_round, parameters, **kwargs):
+        return self._w.evaluate(server_round=server_round, parameters=parameters, **kwargs)
 
-    def evaluate(self, server_round, parameters):
-        return self._w.evaluate(server_round, parameters)
-
-    # ---- Eval scheduling ----
-
-    def configure_evaluate(self, server_round, parameters, client_manager):
-        """Return an empty list to skip evaluation on non-eval rounds."""
+    def configure_evaluate(self, server_round, parameters, client_manager, **kwargs):
         if server_round % self.eval_every != 0:
             return []
-        return self._w.configure_evaluate(server_round, parameters, client_manager)
+        return self._w.configure_evaluate(server_round=server_round, parameters=parameters, client_manager=client_manager, **kwargs)
 
-    # ---- Tracked overrides ----
-
-    def aggregate_fit(self, server_round, results, failures):
-        params, metrics = self._w.aggregate_fit(server_round, results, failures)
+    def aggregate_fit(self, server_round, results, failures, **kwargs):
+        params, metrics = self._w.aggregate_fit(server_round=server_round, results=results, failures=failures, **kwargs)
         if params is not None:
             self.last_params = parameters_to_ndarrays(params)
         return params, metrics
 
-    def aggregate_evaluate(self, server_round, results, failures):
-        loss, metrics = self._w.aggregate_evaluate(server_round, results, failures)
+    def aggregate_evaluate(self, server_round, results, failures, **kwargs):
+        loss, metrics = self._w.aggregate_evaluate(server_round=server_round, results=results, failures=failures, **kwargs)
 
-        # Free CUDA memory fragmented by Ray virtual-client teardown
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
 
         if metrics:
-            record = dict(metrics)
+            record        = dict(metrics)
             record["round"] = server_round
             self.round_metrics.append(record)
-
             total_rounds = (
                 self._w.cfg.get("federation", {}).get("num_rounds", "?")
                 if hasattr(self._w, "cfg") else "?"
@@ -170,7 +182,7 @@ def _load_final_model(
     if len(params) != len(state_dict):
         raise ValueError(
             f"Parameter count mismatch: state_dict has {len(state_dict)} tensors "
-            f"but received {len(params)} from FL training. "
+            f"but received {len(params)}. "
             f"Ensure get_parameters() uses state_dict().values()."
         )
 
@@ -190,7 +202,8 @@ def run(
     cfg:          dict,
     mode:         str,
     seed:         int,
-    eval_every:   int = 5,
+    eval_every:   int  = 5,
+    use_fedprox:  bool = False,
 ) -> dict:
     set_seeds(seed)
     configure_cuda()
@@ -198,27 +211,34 @@ def run(
     device  = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     use_amp = device.type == "cuda"
 
-    use_simulation, use_fedprox, strategy_name = MODE_CONFIG[mode]
+    use_simulation, strategy_name = _MODE_BASE[mode]
+
+    # --mode fedprox always enables the proximal term regardless of --use-fedprox
+    # --mode proposed + --use-fedprox = similarity-weighted + proximal constraint
+    _use_fedprox = use_fedprox or (mode == "fedprox")
+
     num_clients = len(cfg["data"]["clients"])
     num_rounds  = cfg["federation"]["num_rounds"]
     local_ep    = cfg["training"]["epochs_local"]
     results_dir = cfg["evaluation"]["results_dir"]
     os.makedirs(results_dir, exist_ok=True)
 
-    # Effective training = rounds × local_epochs
     effective_ep = num_rounds * local_ep
     print(
         f"\n[Federated | {mode.upper()}]"
-        f"  seed={seed}  rounds={num_rounds}  local_ep={local_ep}"
+        f"  seed={seed}"
+        f"  rounds={num_rounds}"
+        f"  local_ep={local_ep}"
         f"  effective_ep={effective_ep}"
         f"  eval_every={eval_every}"
-        f"  device={device}  AMP={use_amp}"
+        f"  use_fedprox={_use_fedprox}"
+        f"  device={device}"
+        f"  AMP={use_amp}"
         f"  workers={NUM_WORKERS}"
         f"  sim={'on' if use_simulation else 'off'}"
-        f"  fedprox={'on' if use_fedprox else 'off'}"
     )
 
-    # Build initial model + serialise via state_dict (includes buffers)
+    # ---- Build initial model → serialise via state_dict ----
     init_model  = build_model(cfg)
     init_params = [
         val.detach().cpu().numpy()
@@ -231,12 +251,12 @@ def run(
     client_fn = make_client_fn(
         cfg,
         use_simulation,
-        use_fedprox,
+        _use_fedprox,
         device,
         use_amp=use_amp,
     )
 
-    # GPU fraction for Ray VCE
+    # ---- GPU fraction for Ray VCE ----
     if sys.platform == "win32":
         gpu_fraction = 0.0
         gpu_note     = "Ray GPU mgmt disabled on Windows; PyTorch uses CUDA directly"
@@ -259,7 +279,8 @@ def run(
         client_resources = {"num_cpus": 2, "num_gpus": gpu_fraction},
     )
     elapsed = time.time() - t0
-    print(f"\n  Simulation finished in {elapsed/60:.1f} min")
+    print(f"\n  Simulation finished in {elapsed/60:.1f} min"
+          f"  ({elapsed/num_rounds:.1f} s/round avg)")
 
     if strategy.last_params is None:
         raise RuntimeError(
@@ -272,10 +293,9 @@ def run(
 
     # ---- Per-client final evaluation (MC-Dropout) ----
     print("\n  Final per-client evaluation (MC-Dropout on trained global model):")
-    results_row           = {"experiment": mode, "seed": seed}
-    all_preds, all_trues  = [], []
+    results_row          = {"experiment": mode, "seed": seed}
+    all_preds, all_trues = [], []
 
-    # pin_memory only safe when dataloader workers > 0
     use_pin = (NUM_WORKERS > 0) and (device.type == "cuda")
 
     for fd in cfg["data"]["clients"]:
@@ -335,7 +355,6 @@ def run(
             writer.writerows(strategy.round_metrics)
         print(f"  Convergence: {conv_path}")
 
-    # Append results row
     csv_path = os.path.join(results_dir, f"{mode}.csv")
     log_results(results_row, csv_path)
     print(f"  Results: {csv_path}")
@@ -352,74 +371,66 @@ def main():
         description=(
             "Federated PdM experiments (E2=fedavg, E3=fedprox, E4=proposed).\n"
             "\n"
-            "Recommended settings for a fair comparison with centralised E1:\n"
-            "  --rounds 50 --local-epochs 3 --eval-every 5\n"
+            "Quick sanity check (confirms FL trains without divergence):\n"
+            "  --mode proposed --rounds 10 --local-epochs 1 --eval-every 2\n"
             "\n"
-            "This gives 150 effective local training epochs, comparable to\n"
-            "centralised training at 50 epochs with full data access."
+            "Full run for paper (fair vs E1 centralised, 50 epochs):\n"
+            "  --mode proposed --rounds 50 --local-epochs 3 --eval-every 5\n"
+            "\n"
+            "Strongest anti-drift config (similarity-weighted + FedProx):\n"
+            "  --mode proposed --rounds 50 --local-epochs 3 --use-fedprox\n"
         ),
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
-    parser.add_argument("--config",       default="config.yaml")
+    parser.add_argument("--config", default="config.yaml")
     parser.add_argument(
         "--mode",
         choices=["fedavg", "fedprox", "proposed"],
         required=True,
-        help="Which experiment to run",
     )
-    parser.add_argument(
-        "--seed",
-        type=int,
-        default=None,
-        help="Single seed. Omit to use config default.",
-    )
-    parser.add_argument(
-        "--all_seeds",
-        action="store_true",
-        help="Run all 5 seeds from config (for statistical significance).",
-    )
+    parser.add_argument("--seed",      type=int, default=None)
+    parser.add_argument("--all_seeds", action="store_true")
     parser.add_argument(
         "--rounds",
-        type=int,
-        default=None,
-        help="Override number of FL rounds. Recommended: 50.",
+        type=int, default=None,
+        help="Override FL rounds. Recommended: 50.",
     )
     parser.add_argument(
         "--local-epochs",
-        type=int,
-        default=None,
-        dest="local_epochs",
+        type=int, default=None, dest="local_epochs",
         help=(
-            "Override cfg[training][epochs_local]. Each FL round runs this "
-            "many local gradient steps per client. Recommended: 3–5."
+            "Override epochs_local. "
+            "IMPORTANT: use 1 if you observe RMSE increasing across rounds "
+            "(client drift). Use 3 only once convergence is confirmed stable."
         ),
     )
     parser.add_argument(
         "--eval-every",
-        type=int,
-        default=5,
-        dest="eval_every",
+        type=int, default=5, dest="eval_every",
+        help="Evaluate every N rounds (default: 5 — saves ~80%% eval time).",
+    )
+    parser.add_argument(
+        "--use-fedprox",
+        action="store_true", dest="use_fedprox",
         help=(
-            "Run Flower evaluate step only every N rounds. "
-            "Setting this to 5 saves ~80%% of eval overhead. "
-            "Set to 1 to evaluate every round. Default: 5."
+            "Enable FedProx proximal term in 'proposed' mode. "
+            "Adds μ/2·||w_local − w_global||² to constrain client drift. "
+            "Recommended when local-epochs > 1. μ is set via federation.fedprox_mu "
+            "in config.yaml (default 0.01)."
         ),
     )
     args = parser.parse_args()
 
     cfg = load_config(args.config)
 
-    # Apply CLI overrides to config dict before any client/strategy is created
     if args.rounds is not None:
         cfg["federation"]["num_rounds"] = args.rounds
     if args.local_epochs is not None:
         cfg["training"]["epochs_local"] = args.local_epochs
-        print(
-            f"[Override] epochs_local → {args.local_epochs}"
-            f"  (effective training = {cfg['federation']['num_rounds']}"
-            f" × {args.local_epochs} = "
-            f"{cfg['federation']['num_rounds'] * args.local_epochs} steps)"
-        )
+        rds = cfg["federation"]["num_rounds"]
+        ep  = args.local_epochs
+        print(f"[Override] epochs_local={ep}  "
+              f"effective_training={rds * ep} steps total")
 
     if args.seed is not None:
         seeds = [args.seed]
@@ -428,9 +439,16 @@ def main():
     else:
         seeds = [cfg["reproducibility"]["seed"]]
 
-    print(f"Experiment: {args.mode.upper()}  |  Seeds: {seeds}")
+    print(f"Experiment: {args.mode.upper()}  |  Seeds: {seeds}  "
+          f"|  use_fedprox={args.use_fedprox}")
     for seed in seeds:
-        run(cfg, args.mode, seed, eval_every=args.eval_every)
+        run(
+            cfg,
+            args.mode,
+            seed,
+            eval_every  = args.eval_every,
+            use_fedprox = args.use_fedprox,
+        )
 
     print(f"\nDone. Results in {cfg['evaluation']['results_dir']}/{args.mode}.csv")
 
