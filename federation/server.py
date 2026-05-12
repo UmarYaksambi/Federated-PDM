@@ -174,7 +174,7 @@ class FedProxStrategy(_BaseCustomStrategy):
         ws    = np.array([n / total for _, n in params_list])
         agg   = _weighted_average(params_list, ws)
         metrics = _aggregate_fit_metrics(
-            [(n, fit_res.metrics)
+            [(fit_res.num_examples, fit_res.metrics)
              for _, fit_res in results if fit_res.metrics is not None]
         )
         return ndarrays_to_parameters(agg), metrics
