@@ -51,6 +51,7 @@ runs/
 events.out.tfevents.*
 /kaggle/
 *.tmp
+*.sh
 
 # =========================
 # IDE / Editor
