@@ -449,8 +449,8 @@ def main():
         help="Run all seeds from config.evaluation.seeds for each variant.",
     )
     parser.add_argument(
-        "--rounds",     type=int, default=None,
-        help="Override federation.num_rounds (e.g. --rounds 100 for quick test).",
+        "--rounds",     type=int, default=100,
+        help="Override federation.num_rounds (Default: 100 to allow noise phase-out).",
     )
     parser.add_argument(
         "--local-epochs", dest="local_epochs", type=int, default=None,
