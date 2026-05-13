@@ -28,6 +28,7 @@ results/             # Evaluation metrics and logs
 results/*
 *.csv
 *.txt
+!requirements.txt
 *.zip
 *.tar
 *.gz
