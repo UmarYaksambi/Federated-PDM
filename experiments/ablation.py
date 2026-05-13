@@ -28,7 +28,7 @@ import torch
 import torch.nn as nn
 import yaml
 import flwr as fl
-from flwr.common import parameters_to_ndarrays
+from flwr.common import Context, parameters_to_ndarrays
 
 from evaluate import compute_metrics, make_loader, log_results
 from federation.client import PDMClient
@@ -208,7 +208,8 @@ class _AblationClient(PDMClient):
         self.model.load_state_dict(new_state, strict=True)
 
     def get_parameters(self, config: dict) -> list[np.ndarray]:
-        return [p.cpu().numpy() for p in self.model.parameters()]
+        # FIX: state_dict().values() detached natively, ensuring length perfectly matches
+        return [val.cpu().numpy() for val in self.model.state_dict().values()]
 
 
 # ---------------------------------------------------------------------------
@@ -231,29 +232,29 @@ class _TrackingStrategy(fl.server.strategy.Strategy):
         self.eval_every = eval_every
         self.last_params: list[np.ndarray] | None = None
 
-    def initialize_parameters(self, cm):
-        return self._w.initialize_parameters(cm)
+    def initialize_parameters(self, client_manager=None, **kwargs):
+        return self._w.initialize_parameters(client_manager=client_manager, **kwargs)
 
-    def configure_fit(self, r, p, cm):
-        return self._w.configure_fit(r, p, cm)
+    def configure_fit(self, server_round, parameters, client_manager, **kwargs):
+        return self._w.configure_fit(server_round, parameters, client_manager, **kwargs)
 
-    def configure_evaluate(self, server_round, parameters, client_manager):
+    def configure_evaluate(self, server_round, parameters, client_manager, **kwargs):
         # Skip evaluation on non-designated rounds to cut wall-clock time.
         if server_round % self.eval_every != 0:
             return []
-        return self._w.configure_evaluate(server_round, parameters, client_manager)
+        return self._w.configure_evaluate(server_round, parameters, client_manager, **kwargs)
 
-    def evaluate(self, r, p):
-        return self._w.evaluate(r, p)
+    def evaluate(self, server_round, parameters, **kwargs):
+        return self._w.evaluate(server_round, parameters, **kwargs)
 
-    def aggregate_fit(self, server_round, results, failures):
-        params, metrics = self._w.aggregate_fit(server_round, results, failures)
+    def aggregate_fit(self, server_round, results, failures, **kwargs):
+        params, metrics = self._w.aggregate_fit(server_round, results, failures, **kwargs)
         if params is not None:
             self.last_params = parameters_to_ndarrays(params)
         return params, metrics
 
-    def aggregate_evaluate(self, server_round, results, failures):
-        return self._w.aggregate_evaluate(server_round, results, failures)
+    def aggregate_evaluate(self, server_round, results, failures, **kwargs):
+        return self._w.aggregate_evaluate(server_round, results, failures, **kwargs)
 
 
 # ---------------------------------------------------------------------------
@@ -314,14 +315,21 @@ def run_variant(
     # Build initial model (correct architecture for this variant)
     base_init  = build_model(cfg)
     init_model = base_init if use_attention else _TCNNoAttention(base_init)
-    init_params = [p.detach().numpy() for p in init_model.parameters()]
+    
+    # FIX: Extract state_dict().values() to perfectly match what clients expect
+    init_params = [val.cpu().numpy() for val in init_model.state_dict().values()]
 
     base_strategy = build_strategy(strategy_name, cfg, init_params)
     strategy      = _TrackingStrategy(base_strategy, eval_every=eval_every)
 
-    # Client factory — Fix 1: use_fedprox comes from variant dict
-    def client_fn(cid: str) -> _AblationClient:
-        fd = fd_keys[int(cid)]
+    # Client factory - FIX: Uses 'Context' instead of 'cid: str'
+    def client_fn(context: Context):
+        partition_id = context.node_config.get(
+            "partition-id", int(context.node_id)
+        )
+        fd = fd_keys[int(partition_id) % len(fd_keys)]
+        
+        # FIX: Returns .to_client() directly to satisfy Flower's updated API
         return _AblationClient(
             fd             = fd,
             cfg            = cfg,
@@ -330,7 +338,10 @@ def run_variant(
             device         = device,
             use_phys_loss  = use_phys_loss,
             use_attention  = use_attention,
-        )
+        ).to_client()
+
+    # Calculate safe GPU fraction to prevent CUDA OOM / Race conditions
+    gpu_fraction = 1.0 / len(fd_keys) if torch.cuda.is_available() else 0.0
 
     # Run FL simulation
     fl.simulation.start_simulation(
@@ -340,7 +351,7 @@ def run_variant(
                                num_rounds=cfg["federation"]["num_rounds"]
                            ),
         strategy         = strategy,
-        client_resources = {"num_cpus": 1, "num_gpus": 0.0},
+        client_resources = {"num_cpus": 2, "num_gpus": gpu_fraction},
     )
 
     if strategy.last_params is None:
